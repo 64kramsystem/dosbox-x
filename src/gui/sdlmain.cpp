@@ -143,6 +143,9 @@ char* revert_escape_newlines(const char* aMessage);
 #include "callback.h"
 #include "support.h"
 #include "debug.h"
+#if C_REMOTEDEBUG
+#include "qmp.h"
+#endif
 #include "ide.h"
 #include "bitop.h"
 #include "ptrop.h"
@@ -1523,6 +1526,62 @@ static bool IsFullscreen() {
 bool is_paused = false;
 bool unpause_now = false;
 bool pausewithinterrupts_enable = false;
+
+#if C_REMOTEDEBUG
+#include <atomic>
+static void PauseDOSBoxLoop(Bitu);  // Forward declaration
+void PushDummySDL(void);  // Forward declaration
+static std::atomic<EmulatorControlRequest> pending_control_request{EmulatorControlRequest::NONE};
+
+void EMULATOR_RequestPause() {
+    pending_control_request.store(EmulatorControlRequest::PAUSE);
+}
+
+void EMULATOR_RequestResume() {
+    // Resume can be done directly - just set the flag and push an event
+    if (is_paused) {
+        unpause_now = true;
+        PushDummySDL();
+    }
+}
+
+void EMULATOR_RequestReset(bool dos_only) {
+    pending_control_request.store(dos_only ? EmulatorControlRequest::RESET_DOS : EmulatorControlRequest::RESET);
+    EMULATOR_WakePause();
+}
+
+bool EMULATOR_IsPaused() {
+    return is_paused;
+}
+
+void EMULATOR_WakePause() {
+    if (is_paused) PushDummySDL();
+}
+
+bool EMULATOR_CheckPendingControl() {
+    EmulatorControlRequest req = pending_control_request.exchange(EmulatorControlRequest::NONE);
+    if (req == EmulatorControlRequest::NONE) {
+        return false;
+    }
+
+    switch (req) {
+        case EmulatorControlRequest::PAUSE:
+            if (!is_paused) {
+                PIC_AddEvent(PauseDOSBoxLoop, 0.001);
+            }
+            break;
+        case EmulatorControlRequest::RESET:
+            is_paused = false;
+            throw int(3);  // Full system reboot
+        case EmulatorControlRequest::RESET_DOS:
+            is_paused = false;
+            throw int(6);  // DOS kernel reboot only
+        default:
+            break;
+    }
+    return true;
+}
+#endif
 #if DOSBOXMENU_TYPE == DOSBOXMENU_NSMENU
 int pause_menu_item_tag = -1;
 #endif
@@ -1654,6 +1713,13 @@ void PauseDOSBoxLoop(Bitu /*unused*/) {
             unpause_now = false;
             break;
         }
+
+#if C_REMOTEDEBUG
+        // Serve QMP while paused: memory reads, state save/load and reset
+        QMP_ProcessPendingRequests();
+        SAVESTATE_CheckPendingRequest();
+        EMULATOR_CheckPendingControl();
+#endif
 
 #if C_EMSCRIPTEN
         emscripten_sleep(0);
@@ -10648,6 +10714,13 @@ fresh_boot:
 
 #if DOSBOXMENU_TYPE == DOSBOXMENU_HMENU
         Reflect_Menu();
+#endif
+
+#if C_REMOTEDEBUG
+        /* stop the remote debugging servers before their state is torn down;
+           QMP first, since its thread reads the GDB server state */
+        DEBUG_StopQMPServer();
+        DEBUG_StopGDBServer();
 #endif
 
         /* and then shutdown */

@@ -70,6 +70,31 @@ void DEBUG_AgentCopyTraceEvents(std::vector<DEBUG_AgentTraceEvent>* events);
 #endif
 #endif
 
+// Exposed for GDB server
+uint32_t DEBUG_GetRegister(int reg);
+// Whether a GDB register write can be applied in the current CPU mode
+bool DEBUG_CanSetRegister(int reg, uint32_t value);
+void DEBUG_SetRegister(int reg, uint32_t value);
+uint8_t DEBUG_ReadMemory(uint32_t address);
+void DEBUG_WriteMemory(uint32_t address, uint8_t value);
+bool DEBUG_SetBreakpoint(uint32_t address);
+bool DEBUG_RemoveBreakpoint(uint32_t address);
+#if C_REMOTEDEBUG
+void DEBUG_StartGDBServer(int port);
+void DEBUG_StopGDBServer();
+void DEBUG_StartQMPServer(int port);
+void DEBUG_StopQMPServer();
+// Called by main loop to check and handle GDB step/continue requests
+// Returns true if a step was executed (caller should return from loop)
+bool DEBUG_CheckGDBStep();
+
+bool DEBUG_IsGDBClientConnected();
+bool DEBUG_IsGDBStopped();  // A GDB client holds the CPU stopped
+
+// GDB-aware program execution (for QMP debug-execute)
+void DEBUG_SetGDBBreakOnExec(bool enable); // Set flag to break at entry for GDB
+#endif
+
 extern Bitu cycle_count;
 extern Bitu debugCallback;
 

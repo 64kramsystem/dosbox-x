@@ -7,6 +7,7 @@ cpu.h \
 cross.h \
 control.h \
 debug.h \
+gdbserver.h \
 dma.h \
 dos_inc.h \
 dos_system.h \
@@ -31,6 +32,7 @@ pci_bus.h \
 pic.h \
 programs.h \
 qcow2_disk.h \
+qmp.h \
 render.h \
 regs.h \
 render.h \

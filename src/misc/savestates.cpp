@@ -6,6 +6,8 @@
 #include <string>
 #include <cstring>
 #include <fstream>
+#include <atomic>
+#include <mutex>
 #include "SDL.h"
 #include "menu.h"
 #include "shell.h"
@@ -51,10 +53,32 @@ bool auto_save_state=false;
 bool noremark_save_state = false;
 bool force_load_state = false;
 std::string saveloaderr="";
+
+#if C_REMOTEDEBUG
+enum class SaveStateRequest { NONE, SAVE, LOAD };
+static std::atomic<SaveStateRequest> pending_savestate_request{SaveStateRequest::NONE};
+static std::string pending_savestate_path;
+static std::string savestate_result_error;
+static std::atomic<bool> savestate_request_complete{false};
+static std::mutex savestate_mutex;
+#endif
+
 void refresh_slots(void);
 void GFX_LosingFocus(void), GFX_ReleaseMouse(void), MAPPER_ReleaseAllKeys(void), resetFontSize(void);
 bool systemmessagebox(char const * aTitle, char const * aMessage, char const * aDialogType, char const * aIconType, int aDefaultButton);
 extern std::string working_dir;
+#if C_REMOTEDEBUG
+// Set while a QMP request saves or loads a state: failures are recorded for
+// the client instead of shown in a dialog that would block emulation.
+static bool savestate_remote_request = false;
+static std::string savestate_remote_error;
+
+static bool SAVESTATE_RecordRemoteError(const std::string& message) {
+    if (!savestate_remote_request) return false;
+    if (savestate_remote_error.empty()) savestate_remote_error = message;
+    return true;
+}
+#endif
 
 namespace
 {
@@ -149,6 +173,9 @@ namespace
 	void notifyError(const std::string& message, bool log=true)
 	{
 		if (log) LOG_MSG("%s",message.c_str());
+#if C_REMOTEDEBUG
+		if (SAVESTATE_RecordRemoteError(message)) return;
+#endif
 		systemmessagebox("Error",message.c_str(),"ok","error", 1);
 	}
 
@@ -307,6 +334,95 @@ void LoadGameState_Run(void) { LoadGameState(true); }
 void NextSaveSlot_Run(void) { NextSaveSlot(true); }
 void PreviousSaveSlot_Run(void) { PreviousSaveSlot(true); }
 void LastAutoSaveSlot_Run(void) { LastAutoSaveSlot(true); }
+
+#if C_REMOTEDEBUG
+void SAVESTATE_RequestSave(const std::string& filepath) {
+    std::lock_guard<std::mutex> lock(savestate_mutex);
+    pending_savestate_path = filepath;
+    savestate_result_error.clear();
+    savestate_request_complete.store(false);
+    pending_savestate_request.store(SaveStateRequest::SAVE);
+    EMULATOR_WakePause();
+}
+
+void SAVESTATE_RequestLoad(const std::string& filepath) {
+    std::lock_guard<std::mutex> lock(savestate_mutex);
+    pending_savestate_path = filepath;
+    savestate_result_error.clear();
+    savestate_request_complete.store(false);
+    pending_savestate_request.store(SaveStateRequest::LOAD);
+    EMULATOR_WakePause();
+}
+
+bool SAVESTATE_IsPending() {
+    return pending_savestate_request.load() != SaveStateRequest::NONE;
+}
+
+bool SAVESTATE_IsComplete(std::string& error_out) {
+    if (!savestate_request_complete.load()) return false;
+    std::lock_guard<std::mutex> lock(savestate_mutex);
+    error_out = savestate_result_error;
+    return true;
+}
+
+bool SAVESTATE_CheckPendingRequest() {
+    SaveStateRequest request = pending_savestate_request.load();
+    if (request == SaveStateRequest::NONE) return false;
+
+    std::string filepath;
+    {
+        std::lock_guard<std::mutex> lock(savestate_mutex);
+        filepath = pending_savestate_path;
+    }
+
+    std::string old_savefilename = savefilename;
+    bool old_use_save_file = use_save_file;
+    bool old_noremark_save_state = noremark_save_state;
+    bool old_force_load_state = force_load_state;
+    savefilename = filepath;
+    use_save_file = true;
+    noremark_save_state = true;
+    force_load_state = true;
+
+    std::string error;
+    savestate_remote_request = true;
+    savestate_remote_error.clear();
+    try {
+        if (request == SaveStateRequest::SAVE) {
+            SaveState::instance().save(0);
+        } else {
+            if (!GFX_IsFullscreen() && render.aspect) GFX_LosingFocus();
+            SaveState::instance().load(0);
+#if defined(USE_TTF)
+            if (ttf.inUse) resetFontSize();
+#endif
+        }
+    } catch (const SaveState::Error& caught) {
+        error = caught;
+    } catch (const std::exception& caught) {
+        error = caught.what();
+    } catch (...) {
+        error = "Unknown exception";
+    }
+    // save() and load() return normally on failure; they record it instead
+    if (error.empty()) error = savestate_remote_error;
+    savestate_remote_request = false;
+
+    savefilename = old_savefilename;
+    use_save_file = old_use_save_file;
+    noremark_save_state = old_noremark_save_state;
+    force_load_state = old_force_load_state;
+
+    {
+        std::lock_guard<std::mutex> lock(savestate_mutex);
+        savestate_result_error = error;
+    }
+    // Completion first: a waiter seeing the request cleared must see it complete
+    savestate_request_complete.store(true);
+    pending_savestate_request.store(SaveStateRequest::NONE);
+    return true;
+}
+#endif
 
 void ShowStateInfo(bool pressed) {
 	if (!pressed) return;
@@ -577,6 +693,9 @@ done:
 
 void savestatecorrupt(const char* part) {
 	LOG_MSG("Save state corrupted! Program in inconsistent state! - %s", part);
+#if C_REMOTEDEBUG
+	if (SAVESTATE_RecordRemoteError(MSG_Get("SAVE_CORRUPTED"))) return;
+#endif
 	systemmessagebox("Error", MSG_Get("SAVE_CORRUPTED"),"ok","error", 1);
 }
 
@@ -784,6 +903,9 @@ done:
 
 	if (!dos_kernel_disabled) flagged_restore((char *)save.c_str());
 	if (!load_err) LOG_MSG("[%s]: Loaded. (Slot %d)", getTime().c_str(), (int)slot+1);
+#if C_REMOTEDEBUG
+	else SAVESTATE_RecordRemoteError("Not a valid DOSBox-X save state, or it does not match this emulator: " + save);
+#endif
 }
 
 bool SaveState::isEmpty(size_t slot) const {

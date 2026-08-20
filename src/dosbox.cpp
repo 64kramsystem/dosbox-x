@@ -56,6 +56,9 @@
 #include "agent/agent_bridge.h"
 #endif // defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
 #include "debug.h"
+#if C_REMOTEDEBUG
+#include "qmp.h"
+#endif
 #include "cpu.h"
 #include "logging.h"
 #include "menudef.h"
@@ -471,6 +474,19 @@ static Bitu Normal_Loop(void) {
         while (1) {
 #if defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
             dosbox_agent::AGENT_BridgePump();
+#endif
+#if C_REMOTEDEBUG
+            // Check for GDB step/continue requests from the GDB server thread
+            if (DEBUG_CheckGDBStep()) {
+                // Step was executed, return to allow loop to be called again
+                return 0;
+            }
+            // Check for save/load state requests from QMP
+            SAVESTATE_CheckPendingRequest();
+            // Check for emulator control requests from QMP (pause/reset)
+            EMULATOR_CheckPendingControl();
+            // Process pending QMP input events (keyboard, mouse) - thread-safe queue
+            QMP_ProcessPendingInputEvents();
 #endif
             if (PIC_RunQueue()) {
                 /* now is the time to check for the NMI (Non-maskable interrupt) */
@@ -1773,6 +1789,20 @@ void DOSBOX_SetupConfigSections(void) {
     Pint = secprop->Add_int("mcp_server", Property::Changeable::OnlyAtStart, 0);
     Pint->SetMinMax(0, 65535);
     Pint->Set_help("TCP port of the external debugger MCP server on 127.0.0.1. Set to 0 to disable debugger MCP control.");
+
+#if C_REMOTEDEBUG
+    Pbool = secprop->Add_bool("gdbserver",Property::Changeable::OnlyAtStart,false);
+    Pbool->Set_help("If set, start a GDB remote debugging server. Allows external debuggers to connect.");
+
+    Pint = secprop->Add_int("gdbserver port",Property::Changeable::OnlyAtStart,2159);
+    Pint->Set_help("TCP port for the GDB server to listen on.");
+
+    Pbool = secprop->Add_bool("qmpserver",Property::Changeable::OnlyAtStart,false);
+    Pbool->Set_help("If set, start a QMP (QEMU Monitor Protocol) server for keyboard input injection.");
+
+    Pint = secprop->Add_int("qmpserver port",Property::Changeable::OnlyAtStart,4444);
+    Pint->Set_help("TCP port for the QMP server to listen on.");
+#endif
 
     Pstring = secprop->Add_string("machine",Property::Changeable::OnlyAtStart,"svga_s3");
     Pstring->Set_values(machines);

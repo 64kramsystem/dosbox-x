@@ -19,6 +19,7 @@
 #pragma once
 
 #include <stdio.h> // for FILE*, for OpenCaptureFile()
+#include <string>  // for std::string
 
 class Section;
 enum OPL_Mode {
@@ -56,3 +57,8 @@ void CAPTURE_AddImage(Bitu width, Bitu height, Bitu bpp, Bitu pitch, Bitu flags,
 void CAPTURE_AddMidi(bool sysex, Bitu len, uint8_t * data);
 void CAPTURE_VideoStart();
 void CAPTURE_VideoStop();
+
+// Screenshot API for remote debugging
+void CAPTURE_TakeScreenshot();               // Trigger screenshot capture
+std::string CAPTURE_GetLastScreenshotPath(); // Get path of last screenshot (clears after read)
+void CAPTURE_ClearLastScreenshotPath();      // Clear the last screenshot path

@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <errno.h>
 #include <fstream>
+#include <algorithm>
 
 #if defined(WIN32)
 #include <conio.h>
@@ -769,7 +770,11 @@ void DEBUG_ShowMsg(char const* format,...) {
     }
 
     va_start(msg,format);
-	len = (size_t)vsnprintf(buf,sizeof(buf)-2u,format,msg); /* <- NTS: Did you know sprintf/vsnprintf returns number of chars written? */
+	{
+		/* vsnprintf returns the length it would have written: clamp to what fits */
+		const int written = vsnprintf(buf,sizeof(buf)-2u,format,msg);
+		len = written < 0 ? 0 : std::min((size_t)written, sizeof(buf)-3u);
+	}
 	va_end(msg);
 
     /* remove newlines if present */
@@ -1057,6 +1062,7 @@ void LOG::EarlyInit(void) {
 	loggrp[LOG_PCI].front="PCI";
 	
 	loggrp[LOG_VOODOO].front="SST";
+	loggrp[LOG_REMOTE].front="REMOTE";
 
 	do_LOG_stderr = control->opt_earlydebug;
 
