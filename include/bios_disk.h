@@ -426,6 +426,9 @@ extern RealPt imgDTAPtr; /* Real memory location of temporary DTA pointer for fa
 extern DOS_DTA *imgDTA;
 
 void swapInDisks(int drive);
+void swapInDrive(int drive, unsigned int position);
+// Drive (0 = A:, 1 = B:) whose image list swapInDrive cycles, or -1 for none.
+extern int swapInDisksSpecificDrive;
 bool getSwapRequest(void);
 imageDisk *GetINT13HardDrive(unsigned char drv);
 imageDisk *GetINT13FloppyDrive(unsigned char drv);

@@ -30,6 +30,7 @@
 #include "logging.h"
 #include "debug.h"
 #include "hardware.h"
+#include "bios_disk.h"
 #include "mem.h"
 #include "paging.h"
 
@@ -455,6 +456,8 @@ void QMPServer::process_command(const std::string& cmd) {
         handle_query_status();
     } else if (execute == "debug-break-on-exec") {
         handle_debug_break_on_exec(cmd);
+    } else if (execute == "swap-floppy") {
+        handle_swap_floppy(cmd);
     } else if (!execute.empty()) {
         send_error("CommandNotFound", "Command not found: " + execute);
     } else {
@@ -470,6 +473,13 @@ void QMPServer::handle_qmp_capabilities() {
 void QMPServer::queue_input_event(const QMPInputEvent& event) {
     std::lock_guard<std::mutex> lock(input_queue_mutex);
     input_queue.push(event);
+}
+
+// True when images are mounted for swapping (with IMGMOUNT or BOOT).
+static bool QMP_HasSwapList() {
+    for (unsigned int i = 0; i < MAX_SWAPPABLE_DISKS; i++)
+        if (diskSwap[i] != NULL) return true;
+    return false;
 }
 
 void QMPServer::process_pending_input_events() {
@@ -490,6 +500,11 @@ void QMPServer::process_pending_input_events() {
                 break;
             case QMPInputEventType::KeyRelease:
                 KEYBOARD_AddKey(event.key, false);
+                break;
+            case QMPInputEventType::SwapFloppy:
+                // Another drive's swap list must not advance.
+                if (!QMP_HasSwapList() || swapInDisksSpecificDrive == event.drive)
+                    swapInDrive(event.drive, 0);
                 break;
         }
 
@@ -542,6 +557,20 @@ void QMPServer::process_pending_tasks() {
         }
         task->done_cv.notify_all();
     }
+}
+
+void QMPServer::handle_swap_floppy(const std::string& cmd) {
+    const int drive = extract_int(cmd, "drive", 0);
+    if (drive < 0 || drive > 1) {
+        send_error("GenericError", "Floppy drive must be 0 (A:) or 1 (B:)");
+        return;
+    }
+
+    QMPInputEvent event;
+    event.type = QMPInputEventType::SwapFloppy;
+    event.drive = drive;
+    queue_input_event(event);
+    send_success();
 }
 
 void QMPServer::handle_send_key(const std::string& cmd) {

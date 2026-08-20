@@ -1333,7 +1333,7 @@ void swapInDrive(int drive, unsigned int position=0) {
 #endif
     if (position<1) swapPosition++;
     else swapPosition=position-1;
-    if(diskSwap[swapPosition] == NULL) swapPosition = 0;
+    if(swapPosition < 0 || swapPosition >= MAX_SWAPPABLE_DISKS || diskSwap[swapPosition] == NULL) swapPosition = 0;
     swapInDisks(drive);
     swapping_requested = true;
     DriveManager::CycleDisks(drive, true, position);
