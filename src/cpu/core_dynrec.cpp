@@ -412,7 +412,17 @@ Bits CPU_Core_Dynrec_Trap_Run(void) {
 	cpu.trap_skip = false;
 
 	// let the normal core execute the next (only one!) instruction
+#if C_DEBUG
+	const auto entryEip = reg_eip;
+#endif
 	Bits ret=CPU_Core_Normal_Run();
+#if C_DEBUG
+	// A breakpoint before an instruction must not consume its pending trap.
+	if (ret == (Bits)debugCallback && reg_eip == entryEip) {
+		CPU_Cycles = oldCycles;
+		return ret;
+	}
+#endif
 
 	// trap to int1 unless the last instruction deferred this
 	// (allows hardware interrupts to be served without interaction)

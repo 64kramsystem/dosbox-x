@@ -233,7 +233,17 @@ Bits CPU_Core_Normal_Trap_Run(void) {
 	CPU_Cycles = 1;
 	cpu.trap_skip = false;
 
+#if C_DEBUG
+	const auto entryEip = reg_eip;
+#endif
 	Bits ret=CPU_Core_Normal_Run();
+#if C_DEBUG
+	// A breakpoint before an instruction must not consume its pending trap.
+	if (ret == (Bits)debugCallback && reg_eip == entryEip) {
+		CPU_Cycles = oldCycles;
+		return ret;
+	}
+#endif
 	if (!cpu.trap_skip) CPU_DebugException(DBINT_STEP,reg_eip);
 	CPU_Cycles = oldCycles-1;
 	cpudecoder = &CPU_Core_Normal_Run;
