@@ -3474,10 +3474,10 @@ void DOS_Shell::CMD_SUBST(char * args) {
 			return;
 		}
 
-		if (command.GetCount() != 2) throw 0 ;
+		if (command.GetCount() != 2) throw 5;
 
 		command.FindCommand(1,arg);
-		if( (arg.size()>1) && arg[1] !=':')  throw(0);
+		if( (arg.size()>1) && arg[1] !=':')  throw 5;
 		char temp_str[2] = { 0,0 };
 		temp_str[0]=(char)toupper(args[0]);
 		command.FindCommand(2,arg);
@@ -3512,6 +3512,8 @@ void DOS_Shell::CMD_SUBST(char * args) {
 	}
 	catch(int a){
 		switch (a) {
+			case 0:
+				throw;  // kill switch from a nested emulation loop (for example GDB kill)
 			case 1:
 		       	WriteOut(MSG_Get("SHELL_CMD_SUBST_NO_REMOVE"));
 				break;

@@ -21,6 +21,7 @@ enum class GDBAction {
     STEP,           // Execute single step
     CONTINUE,       // Continue execution until breakpoint
     STOP,           // GDB wants CPU stopped (halt reason query, Ctrl-C)
+    KILL,           // GDB wants the emulator terminated
     DISCONNECT      // Client disconnected
 };
 

@@ -3574,6 +3574,9 @@ public:
             }
             else WriteOut(MSG_Get("PROGRAM_LOADROM_UNRECOGNIZED"));
         }
+        catch(int) {
+            throw;  // kill switch from the video BIOS init run (for example GDB kill)
+        }
         catch(...) {
             return;
         }

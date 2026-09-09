@@ -6741,6 +6741,15 @@ uint32_t DEBUG_GetRegister(int reg) {
  }
 
 #if C_REMOTEDEBUG
+// Shuts the GDB server down before leaving the emulation loop: shutdown runs
+// further emulation, which a GDB stop would otherwise hold indefinitely.
+[[noreturn]] static void DEBUG_GDBKill(void) {
+    gdb_cpu_paused = false;
+    // Stop without deleting: the QMP thread may be reading the server state
+    gdbServer->stop();
+    throw 0;
+}
+
  // Called by the main loop to check and handle GDB commands.
  // Polls the GDB server (non-blocking) and processes any received commands.
  // Returns true if CPU should be paused (caller should return from loop iteration).
@@ -6787,6 +6796,10 @@ uint32_t DEBUG_GetRegister(int reg) {
             LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: GDB stop request");
             gdb_cpu_paused = true;
             return true;  // CPU should pause
+
+        case GDBAction::KILL:
+            LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: GDB kill request");
+            DEBUG_GDBKill();
 
         case GDBAction::DISCONNECT:
             LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: GDB client disconnected");

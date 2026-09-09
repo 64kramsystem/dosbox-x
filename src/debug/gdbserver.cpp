@@ -374,6 +374,14 @@ GDBAction GDBServer::process_command(const std::string& cmd) {
         handle_query(cmd.substr(1));
     } else if (cmd.substr(0, 5) == "vCont") {
         return handle_v_packets(cmd);
+    } else if (cmd == "k") {
+        // Legacy kill: no reply is expected.
+        return GDBAction::KILL;
+    } else if (cmd.substr(0, 6) == "vKill;") {
+        // This stub exposes only one emulated process.
+        send_packet("OK");
+        flush_send_buffer();
+        return GDBAction::KILL;
     } else if (cmd == "D" || cmd.substr(0, 2) == "D;") {
         LOG(LOG_REMOTE, LOG_NORMAL)("GDBServer: Client detaching");
         send_packet("OK");
