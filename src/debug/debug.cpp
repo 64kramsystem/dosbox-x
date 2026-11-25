@@ -19,6 +19,7 @@
 
 #include "dosbox.h"
 #if C_DEBUG
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <list>
@@ -191,6 +192,7 @@ static void LogBIOSMem(void);
 static GDBServer* gdbServer = nullptr;
 static bool gdb_break_on_exec = false;  // Flag for GDB-aware program execution
 static bool gdb_cpu_paused = false;     // CPU paused waiting for GDB command
+static void DEBUG_GDBSendHitReply(void);
 #endif
 
 extern int debuggerrun;
@@ -644,6 +646,9 @@ class CBreakpoint
 public:
 
 	CBreakpoint(void);
+#if C_REMOTEDEBUG
+	~CBreakpoint(void);
+#endif
 	void					SetAddress		(uint16_t seg, uint32_t off)	{ location = (PhysPt)GetAddress(seg,off); type = BKPNT_PHYSICAL; segment = seg; offset = off; };
 	void					SetAddress		(PhysPt adr)				{ location = adr; type = BKPNT_PHYSICAL; };
 	void					SetInt			(uint8_t _intNr, uint16_t ah, uint16_t al)	{ intNr = _intNr; ahValue = ah; alValue = al; type = BKPNT_INTERRUPT; };
@@ -668,6 +673,13 @@ public:
 	static CBreakpoint*		AddBreakpoint		(uint16_t seg, uint32_t off, bool once);
 	static CBreakpoint*		AddIntBreakpoint	(uint8_t intNum, uint16_t ah, uint16_t al, bool once);
 	static CBreakpoint*		AddMemBreakpoint	(uint16_t seg, uint32_t off);
+#if C_REMOTEDEBUG
+	static CBreakpoint*		AddLinearBreakpoint	(PhysPt address);
+#if C_HEAVY_DEBUG
+	static CBreakpoint*		AddLinearMemBreakpoint(PhysPt address, uint8_t value);
+#endif
+	static CBreakpoint*		PeekLastTriggered	(void)					{ return lastTriggered; };
+#endif
 	static void				DeactivateBreakpoints();
 	static void				ActivateBreakpoints	();
 	static void				ActivateBreakpointsExceptAt(PhysPt adr);
@@ -786,6 +798,40 @@ CBreakpoint* CBreakpoint::AddMemBreakpoint(uint16_t seg, uint32_t off)
 	return bp;
 }
 
+#if C_REMOTEDEBUG
+static void DEBUG_GDBForgetBreakpoint(const CBreakpoint* bp);
+
+// Every deletion path (BPDEL, shutdown, GDB, the agent) ends here, so GDB
+// breakpoints never keep a pointer to a freed breakpoint.
+CBreakpoint::~CBreakpoint(void)
+{
+	DEBUG_GDBForgetBreakpoint(this);
+}
+
+// An execution breakpoint at a linear address, valid in every CPU mode.
+CBreakpoint* CBreakpoint::AddLinearBreakpoint(PhysPt address)
+{
+	CBreakpoint* bp = new CBreakpoint();
+	bp->SetAddress(address);
+	bp->offset = address;
+	BPoints.push_front(bp);
+	return bp;
+}
+#endif
+
+#if C_REMOTEDEBUG && C_HEAVY_DEBUG
+CBreakpoint* CBreakpoint::AddLinearMemBreakpoint(PhysPt address, uint8_t value)
+{
+	CBreakpoint* bp = new CBreakpoint();
+	bp->type = BKPNT_MEMORY_LINEAR;
+	bp->offset = address;
+	bp->SetValue(value);
+	bp->Activate(true);
+	BPoints.push_front(bp);
+	return bp;
+}
+#endif
+
 void CBreakpoint::ActivateBreakpoints()
 {
 	// activate all breakpoints
@@ -852,18 +898,18 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 				// Watch Protected Mode Memoryonly in pmode
 				if (bp->GetType()==BKPNT_MEMORY_PROT) {
 					// Check if pmode is active
-					if (!cpu.pmode) return false;
+					if (!cpu.pmode) continue;
 					// Check if descriptor is valid
 					Descriptor desc;
-					if (!cpu.gdt.GetDescriptor(bp->GetSegment(),desc)) return false;
-					if (desc.GetLimit()==0) return false;
+					if (!cpu.gdt.GetDescriptor(bp->GetSegment(),desc)) continue;
+					if (desc.GetLimit()==0) continue;
 				}
 
 				Bitu address; 
 				if (bp->GetType()==BKPNT_MEMORY_LINEAR) address = bp->GetOffset();
 				else address = (Bitu)GetAddress(bp->GetSegment(),bp->GetOffset());
 				uint8_t value=0;
-				if (mem_readb_checked((PhysPt)address,&value)) return false;
+				if (mem_readb_checked((PhysPt)address,&value)) continue;
 				if (bp->GetValue() != value) {
 					// Yup, memory value changed
                     if (bp->GetType()==BKPNT_MEMORY_FREEZE){
@@ -1001,7 +1047,7 @@ bool CBreakpoint::DeleteBreakpoint(uint16_t seg, uint32_t off)
 #endif
 }
 
-#if defined(C_DOSBOX_AGENT)
+#if defined(C_DOSBOX_AGENT) || C_REMOTEDEBUG
 bool CBreakpoint::DeleteBreakpoint(CBreakpoint* breakpoint)
 {
 	if (breakpoint == nullptr)
@@ -1025,7 +1071,7 @@ CBreakpoint* CBreakpoint::ConsumeLastTriggered(void)
 	lastTriggered = nullptr;
 	return result;
 }
-#endif // C_DOSBOX_AGENT
+#endif // C_DOSBOX_AGENT || C_REMOTEDEBUG
 
 void CBreakpoint::ShowList(void)
 {
@@ -5273,7 +5319,7 @@ void DEBUG_Enable_Handler(bool pressed) {
     // A connected GDB client handles every stop
     if (gdbServer != nullptr && gdbServer->is_running() && gdbServer->has_client()) {
         LOG(LOG_REMOTE, LOG_DEBUG)("DEBUG: Breakpoint hit - signaling to GDB client");
-        gdbServer->send_stop_reply();
+        DEBUG_GDBSendHitReply();
         gdb_cpu_paused = true;  // Pause CPU until GDB sends continue/step
         return;
     }
@@ -6741,6 +6787,149 @@ uint32_t DEBUG_GetRegister(int reg) {
  }
 
 #if C_REMOTEDEBUG
+// Breakpoints and watchpoints inserted by GDB, at linear addresses. Each entry
+// owns its CBreakpoints, so removing it never touches breakpoints set by the
+// user or by another entry, and the CBreakpoint destructor drops parts that
+// other code deletes. Insertion and removal are idempotent, as GDB requires.
+// Hardware breakpoints and write watchpoints need heavy debug builds, where
+// breakpoints are checked before each instruction instead of planting 0xCC.
+// Watchpoints trigger when a write changes a byte, after the instruction.
+enum GDBBreakpointType { GDB_SWBREAK = 0, GDB_HWBREAK = 1, GDB_WRITE_WATCH = 2 };
+
+struct GDBBreakpoint {
+    int type;
+    uint32_t address;
+    uint32_t length;
+    std::vector<CBreakpoint*> parts;
+};
+static std::vector<GDBBreakpoint> gdbBreakpoints;
+static const uint32_t GDB_MAX_WATCH_BYTES = 64;
+
+static void DEBUG_GDBForgetBreakpoint(const CBreakpoint* bp) {
+    for (auto it = gdbBreakpoints.begin(); it != gdbBreakpoints.end();) {
+        auto& parts = it->parts;
+        parts.erase(std::remove(parts.begin(), parts.end(), bp), parts.end());
+        // An entry whose breakpoints were all deleted elsewhere is gone.
+        if (parts.empty()) it = gdbBreakpoints.erase(it);
+        else ++it;
+    }
+}
+
+static const GDBBreakpoint* FindGDBBreakpoint(const CBreakpoint* bp) {
+    if (bp == nullptr) return nullptr;
+    for (const auto& entry : gdbBreakpoints)
+        for (const CBreakpoint* part : entry.parts)
+            if (part == bp) return &entry;
+    return nullptr;
+}
+
+int DEBUG_GDBInsertBreakpoint(int type, uint32_t address, uint32_t length) {
+#if !C_HEAVY_DEBUG
+    if (type != GDB_SWBREAK) return 0;
+#endif
+    if (type != GDB_SWBREAK && type != GDB_HWBREAK && type != GDB_WRITE_WATCH) return 0;
+    for (const auto& entry : gdbBreakpoints)
+        if (entry.type == type && entry.address == address &&
+            (type != GDB_WRITE_WATCH || entry.length == length))
+            return 1;
+
+    GDBBreakpoint entry{type, address, type == GDB_WRITE_WATCH ? length : 1, {}};
+    if (type != GDB_WRITE_WATCH) {
+        uint8_t value;
+        if (mem_readb_checked((PhysPt)address, &value)) return -1;
+        entry.parts.push_back(CBreakpoint::AddLinearBreakpoint((PhysPt)address));
+    }
+#if C_HEAVY_DEBUG
+    else {
+        uint32_t total = length;
+        for (const auto& other : gdbBreakpoints)
+            if (other.type == GDB_WRITE_WATCH) total += other.length;
+        if (length == 0 || total > GDB_MAX_WATCH_BYTES || address + length < address)
+            return -1;
+        std::vector<uint8_t> values(length);
+        for (uint32_t i = 0; i < length; i++)
+            if (mem_readb_checked((PhysPt)(address + i), &values[i])) return -1;
+        for (uint32_t i = 0; i < length; i++)
+            entry.parts.push_back(CBreakpoint::AddLinearMemBreakpoint((PhysPt)(address + i), values[i]));
+    }
+#endif
+    gdbBreakpoints.push_back(entry);
+    return 1;
+}
+
+int DEBUG_GDBRemoveBreakpoint(int type, uint32_t address, uint32_t length) {
+#if !C_HEAVY_DEBUG
+    if (type != GDB_SWBREAK) return 0;
+#endif
+    if (type != GDB_SWBREAK && type != GDB_HWBREAK && type != GDB_WRITE_WATCH) return 0;
+    for (const auto& entry : gdbBreakpoints) {
+        if (entry.type != type || entry.address != address ||
+            (type == GDB_WRITE_WATCH && entry.length != length))
+            continue;
+        // Deleting the parts removes the entry from gdbBreakpoints.
+        const std::vector<CBreakpoint*> parts = entry.parts;
+        for (CBreakpoint* part : parts) CBreakpoint::DeleteBreakpoint(part);
+        break;
+    }
+    return 1;
+}
+
+static void DEBUG_GDBRemoveAllBreakpoints() {
+    std::vector<CBreakpoint*> parts;
+    for (const auto& entry : gdbBreakpoints)
+        parts.insert(parts.end(), entry.parts.begin(), entry.parts.end());
+    // Deleting the parts empties gdbBreakpoints
+    for (CBreakpoint* part : parts) CBreakpoint::DeleteBreakpoint(part);
+}
+
+// Takes one watchpoint's current bytes as seen; true (and the first changed
+// address) if any changed.
+static bool DEBUG_GDBResyncWatchpoint(const GDBBreakpoint& entry, uint32_t* address) {
+    bool changed = false;
+    for (CBreakpoint* part : entry.parts) {
+        uint8_t value;
+        if (mem_readb_checked((PhysPt)part->GetOffset(), &value)) continue;
+        if (value == part->GetValue()) continue;
+        part->SetValue(value);
+        if (!changed) *address = part->GetOffset();
+        changed = true;
+    }
+    return changed;
+}
+
+// Reports the first watchpoint whose bytes changed; others stay pending for
+// the following stops.
+static bool DEBUG_GDBResyncWatchpoints(uint32_t* address) {
+    for (const auto& entry : gdbBreakpoints)
+        if (entry.type == GDB_WRITE_WATCH && DEBUG_GDBResyncWatchpoint(entry, address))
+            return true;
+    return false;
+}
+
+// Reports the stop of a breakpoint hit, naming GDB's breakpoint when it caused it.
+
+static void DEBUG_GDBSendHitReply(void) {
+    CBreakpoint* hit = CBreakpoint::PeekLastTriggered();
+    const GDBBreakpoint* entry = FindGDBBreakpoint(hit);
+    if (entry == nullptr) {
+        gdbServer->send_stop_reply();
+        return;
+    }
+    CBreakpoint::ConsumeLastTriggered();
+    switch (entry->type) {
+        case GDB_WRITE_WATCH: {
+            const uint32_t address = hit->GetOffset();
+            // One write can change several bytes of this watchpoint; report it once
+            uint32_t other;
+            DEBUG_GDBResyncWatchpoint(*entry, &other);
+            gdbServer->send_watch_reply(address);
+            break;
+        }
+        case GDB_HWBREAK: gdbServer->send_stop_reason("hwbreak:"); break;
+        default: gdbServer->send_stop_reason("swbreak:"); break;
+    }
+}
+
 // Shuts the GDB server down before leaving the emulation loop: shutdown runs
 // further emulation, which a GDB stop would otherwise hold indefinitely.
 [[noreturn]] static void DEBUG_GDBKill(void) {
@@ -6748,6 +6937,12 @@ uint32_t DEBUG_GetRegister(int reg) {
     // Stop without deleting: the QMP thread may be reading the server state
     gdbServer->stop();
     throw 0;
+}
+
+static void DEBUG_GDBHandleDisconnect(void) {
+    LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: GDB client disconnected");
+    DEBUG_GDBRemoveAllBreakpoints();
+    gdb_cpu_paused = false;
 }
 
  // Called by the main loop to check and handle GDB commands.
@@ -6780,8 +6975,13 @@ uint32_t DEBUG_GetRegister(int reg) {
             uint32_t eip_after = DEBUG_GetRegister(8);
             LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: Step completed, EIP=0x%X->0x%X", eip_before, eip_after);
 
-            // Send stop reply to GDB
-            gdbServer->send_stop_reply();
+            // Send stop reply to GDB. A step that writes a watched byte reports the
+            // watchpoint now, so the next continue does not stop without executing.
+            uint32_t watch_address;
+            if (DEBUG_GDBResyncWatchpoints(&watch_address))
+                gdbServer->send_watch_reply(watch_address);
+            else
+                gdbServer->send_stop_reply();
             gdb_cpu_paused = true;
             return true;  // CPU should pause
         }
@@ -6802,8 +7002,7 @@ uint32_t DEBUG_GetRegister(int reg) {
             DEBUG_GDBKill();
 
         case GDBAction::DISCONNECT:
-            LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: GDB client disconnected");
-            gdb_cpu_paused = false;
+            DEBUG_GDBHandleDisconnect();
             return false;
 
         case GDBAction::NONE:
@@ -6815,23 +7014,7 @@ uint32_t DEBUG_GetRegister(int reg) {
             return false;
     }
  }
-#endif
 
- bool DEBUG_SetBreakpoint(uint32_t address) {
-     uint16_t seg = static_cast<uint16_t>(address >> 4);
-     uint16_t off = static_cast<uint16_t>(address & 0xf);
-     DEBUG_ShowMsg("Adding Breakpoint %x:%x", seg, off);
-     return CBreakpoint::AddBreakpoint(seg, off, false);
- }
-
- bool DEBUG_RemoveBreakpoint(uint32_t address) {
-     uint16_t seg = static_cast<uint16_t>(address >> 4);
-     uint16_t off = static_cast<uint16_t>(address & 0xf);
-     DEBUG_ShowMsg("Removing Breakpoint %x:%x", seg, off);
-     return CBreakpoint::DeleteBreakpoint(seg, off);
- }
-
-#if C_REMOTEDEBUG
  // GDB server start/stop functions
  void DEBUG_StartGDBServer(int port) {
      if (gdbServer != nullptr) return;
@@ -6840,6 +7023,7 @@ uint32_t DEBUG_GetRegister(int reg) {
  }
 
  void DEBUG_StopGDBServer() {
+     DEBUG_GDBRemoveAllBreakpoints();
      if (gdbServer != nullptr) {
          gdbServer->stop();  // This now waits for thread to finish
          delete gdbServer;

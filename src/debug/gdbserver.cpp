@@ -329,6 +329,16 @@ void GDBServer::send_stop_reply() {
     send_packet("S05");  // SIGTRAP
 }
 
+void GDBServer::send_stop_reason(const char* reason) {
+    send_packet(std::string("T05") + reason + ";");
+}
+
+void GDBServer::send_watch_reply(uint32_t address) {
+    char reply[32];
+    snprintf(reply, sizeof(reply), "T05watch:%x;", address);
+    send_packet(reply);
+}
+
 GDBAction GDBServer::process_command(const std::string& cmd) {
     try {
     // Handle Ctrl-C interrupt
@@ -526,6 +536,7 @@ void GDBServer::handle_write_memory(const std::string& args) {
 }
 
 void GDBServer::handle_breakpoint(const std::string& args) {
+    // Z/z type,addr,kind[;cond_list...]
     char type = args[0];
     size_t comma1 = args.find(',');
     size_t comma2 = args.find(',', comma1 + 1);
@@ -536,25 +547,18 @@ void GDBServer::handle_breakpoint(const std::string& args) {
 
     int bp_type = std::stoi(args.substr(1, comma1 - 1));
     uint32_t address = std::stoul(args.substr(comma1 + 1, comma2 - comma1 - 1), nullptr, 16);
+    const size_t kind_end = args.find(';', comma2 + 1);
+    uint32_t kind = std::stoul(args.substr(comma2 + 1, kind_end - comma2 - 1), nullptr, 16);
 
-    if (bp_type != 0) {  // Only software breakpoints supported
-        send_packet("");
-        return;
-    }
-
-    bool success;
-    if (type == 'Z') {
-        success = DEBUG_SetBreakpoint(address);
-    } else {
-        success = DEBUG_RemoveBreakpoint(address);
-    }
-
-    send_packet(success ? "OK" : "E01");
+    // Read and access watchpoints are unsupported; GDB falls back to stepping.
+    const int result = type == 'Z' ? DEBUG_GDBInsertBreakpoint(bp_type, address, kind)
+                                   : DEBUG_GDBRemoveBreakpoint(bp_type, address, kind);
+    send_packet(result > 0 ? "OK" : result == 0 ? "" : "E01");
 }
 
 void GDBServer::handle_query(const std::string& cmd) {
     if (cmd.substr(0, 10) == "Supported:") {
-        send_packet("PacketSize=3fff;swbreak+;vContSupported+;QStartNoAckMode+");
+        send_packet("PacketSize=3fff;swbreak+;hwbreak+;vContSupported+;QStartNoAckMode+");
     } else if (cmd.substr(0, 11) == "fThreadInfo") {
         send_packet("m1");
     } else if (cmd.substr(0, 11) == "sThreadInfo") {

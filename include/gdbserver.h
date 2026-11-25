@@ -44,6 +44,8 @@ public:
 
     // Called by debugger when execution stops (breakpoint, step complete, etc.)
     void send_stop_reply();  // SIGTRAP
+    void send_watch_reply(uint32_t address);  // SIGTRAP for a write watchpoint
+    void send_stop_reason(const char* reason);  // SIGTRAP with a stop reason
 
 private:
     int port;

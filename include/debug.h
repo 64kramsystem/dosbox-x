@@ -77,8 +77,6 @@ bool DEBUG_CanSetRegister(int reg, uint32_t value);
 void DEBUG_SetRegister(int reg, uint32_t value);
 uint8_t DEBUG_ReadMemory(uint32_t address);
 void DEBUG_WriteMemory(uint32_t address, uint8_t value);
-bool DEBUG_SetBreakpoint(uint32_t address);
-bool DEBUG_RemoveBreakpoint(uint32_t address);
 #if C_REMOTEDEBUG
 void DEBUG_StartGDBServer(int port);
 void DEBUG_StopGDBServer();
@@ -87,6 +85,11 @@ void DEBUG_StopQMPServer();
 // Called by main loop to check and handle GDB step/continue requests
 // Returns true if a step was executed (caller should return from loop)
 bool DEBUG_CheckGDBStep();
+
+// GDB breakpoints and watchpoints by Z packet type, at linear addresses:
+// 1 = done, 0 = unsupported in this build, -1 = error
+int DEBUG_GDBInsertBreakpoint(int type, uint32_t address, uint32_t length);
+int DEBUG_GDBRemoveBreakpoint(int type, uint32_t address, uint32_t length);
 
 bool DEBUG_IsGDBClientConnected();
 bool DEBUG_IsGDBStopped();  // A GDB client holds the CPU stopped
