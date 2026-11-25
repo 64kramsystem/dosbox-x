@@ -25,6 +25,8 @@
 #include <errno.h>
 #include <fstream>
 #include <algorithm>
+#include <mutex>
+#include <thread>
 
 #if defined(WIN32)
 #include <conio.h>
@@ -60,6 +62,14 @@ int log_dev_con = 0;
 
 _LogGroup loggrp[LOG_MAX]={{"",LOG_NORMAL},{nullptr,LOG_NORMAL}};
 FILE* debuglog = NULL;
+static std::mutex logMutex;
+// Thread that runs the emulation; other threads (remote debugging servers) may
+// only append to the log, never touch CPU state, the UI or output captures.
+static std::thread::id logEmulationThread;
+
+static bool IsEmulationThread(void) {
+    return logEmulationThread == std::thread::id() || logEmulationThread == std::this_thread::get_id();
+}
 
 #if C_DEBUG
 static bool logBuffHasDiscarded = false;
@@ -113,6 +123,7 @@ static list<string>::iterator logBuffPos = logBuff.end();
 extern int old_cursor_state;
 
 void getlogtext(std::string &str) {
+    std::lock_guard<std::mutex> lock(logMutex);
     str = "";
     std::list<string>::iterator it;
     for (it = logBuff.begin(); it != logBuff.end(); ++it)
@@ -122,6 +133,7 @@ void getlogtext(std::string &str) {
 bool savetologfile(const char *name) {
     std::ofstream out(name);
     if (!out.is_open()) return false;
+    std::lock_guard<std::mutex> lock(logMutex);
     std::list<string>::iterator it;
     for (it = logBuff.begin(); it != logBuff.end(); ++it)
         out << (std::string)(*it) << endl;
@@ -232,7 +244,7 @@ int DBGBlock::win_next_by_order(int order) {
     return order;
 }
 
-void DBGUI_DrawBlankOutputLine(int y) {
+static void DBGUI_DrawBlankOutputLine(int y) {
     if (dbg.win_out == NULL) return;
 
     wattrset(dbg.win_out,COLOR_PAIR(PAIR_GREEN_BLACK));
@@ -269,7 +281,7 @@ void DBGUI_DrawDebugOutputLine(int y,std::string line) {
 //    wclrtoeol(dbg.win_out);
 }
 
-void DEBUG_LimitTopPos(void) {
+static void DEBUG_LimitTopPos(void) {
 	if (dbg.win_out != NULL) {
         int w,h;
 
@@ -288,7 +300,7 @@ void DEBUG_LimitTopPos(void) {
     }
 }
 
-void DEBUG_RefreshPage(char scroll) {
+static void RefreshPageLocked(char scroll) {
 	if (dbg.win_out == NULL) return;
 
 	while (scroll < 0 && logBuffPos!=logBuff.begin()) {
@@ -346,14 +358,21 @@ void DEBUG_RefreshPage(char scroll) {
 	wrefresh(dbg.win_out);
 }
 
+void DEBUG_RefreshPage(char scroll) {
+    std::lock_guard<std::mutex> lock(logMutex);
+    RefreshPageLocked(scroll);
+}
+
 void DEBUG_ScrollHomeOutput(void) {
+    std::lock_guard<std::mutex> lock(logMutex);
     logBuffPos = logBuff.begin();
-    DEBUG_RefreshPage(0);
+    RefreshPageLocked(0);
 }
 
 void DEBUG_ScrollToEndOutput(void) {
+    std::lock_guard<std::mutex> lock(logMutex);
     logBuffPos = logBuff.end();
-    DEBUG_RefreshPage(0);
+    RefreshPageLocked(0);
 }
 
 static void Draw_RegisterLayout(void) {
@@ -655,8 +674,7 @@ void DBGUI_StartUp(void) {
 	MakeSubWindows();
 
     /* make sure the output window is synced up */
-    logBuffPos = logBuff.end();
-    DEBUG_RefreshPage(0);
+    DEBUG_ScrollToEndOutput();
 }
 
 #endif
@@ -740,6 +758,7 @@ void DEBUG_ShowMsg(char const* format,...) {
 	char buf[512];
 	va_list msg;
 	size_t len;
+	std::unique_lock<std::mutex> lock(logMutex);
 
 	/* SDLmain() sets control first thing at startup and zeros the pointer at shutdown.
 	 * control == NULL means we're being called outside SDLmain() when everything has
@@ -757,12 +776,16 @@ void DEBUG_ShowMsg(char const* format,...) {
 		return;
 	}
 
-    if (format==NULL || (log_dev_con == 2 && !logging_con) || control->opt_nolog) return;
-    in_debug_showmsg = true;
+    const bool emulation_thread = IsEmulationThread();
+    // logging_con belongs to the emulation thread; other threads stay quiet
+    if (format==NULL || (log_dev_con == 2 && (!emulation_thread || !logging_con)) || control->opt_nolog) return;
+    if (emulation_thread) {
+        in_debug_showmsg = true;
 
-    // in case of runaway error from the CPU core, user responsiveness can be helpful
-    CPU_CycleLeft += CPU_Cycles;
-    CPU_Cycles = 0;
+        // in case of runaway error from the CPU core, user responsiveness can be helpful
+        CPU_CycleLeft += CPU_Cycles;
+        CPU_Cycles = 0;
+    }
 
     if (!gfx_in_mapper && !in_debug_showmsg) {
         void GFX_Events();
@@ -781,14 +804,17 @@ void DEBUG_ShowMsg(char const* format,...) {
     while (len > 0 && buf[len-1] == '\n') buf[--len] = 0;
 
 #if C_DEBUG
+    // Captures collect output of debugger commands run on the emulation thread.
+    if (emulation_thread) {
 # if defined(C_DOSBOX_AGENT)
-    if (agent_output_capture_active) {
-        if (!agent_output_capture.empty())
-            agent_output_capture += '\n';
-        agent_output_capture += buf;
-    }
+        if (agent_output_capture_active) {
+            if (!agent_output_capture.empty())
+                agent_output_capture += '\n';
+            agent_output_capture += buf;
+        }
 # endif
-	DEBUG_MCP_CaptureMessage(buf);
+        DEBUG_MCP_CaptureMessage(buf);
+    }
 #endif
 
 #if C_DEBUG
@@ -819,9 +845,20 @@ void DEBUG_ShowMsg(char const* format,...) {
 	}
 
 #if C_DEBUG
+	// ncurses is not thread safe: other threads leave drawing to the next refresh.
+	if (!emulation_thread) {
+		logBuff.emplace_back(buf);
+		if (logBuff.size() > MAX_LOG_BUFFER) {
+			logBuffHasDiscarded = true;
+			if (logBuffPos == logBuff.begin()) ++logBuffPos; /* keep the iterator valid */
+			logBuff.pop_front();
+		}
+		return;
+	}
+
 	if (logBuffPos!=logBuff.end()) {
 		logBuffPos=logBuff.end();
-		DEBUG_RefreshPage(0);
+		RefreshPageLocked(0);
 	}
 	logBuff.emplace_back(buf);
 	if (logBuff.size() > MAX_LOG_BUFFER) {
@@ -849,6 +886,8 @@ void DEBUG_ShowMsg(char const* format,...) {
         }
 	}
 
+    // Drawing input and waiting for events can re-enter logging.
+    lock.unlock();
     if (IsDebuggerActive() && debugPageStopAt > 0) {
         if (++debugPageCounter >= debugPageStopAt) {
             debugPageCounter = 0;
@@ -895,11 +934,12 @@ void DEBUG_ShowMsg(char const* format,...) {
     }
 #endif
 
-    in_debug_showmsg = false;
+    if (emulation_thread) in_debug_showmsg = false;
 }
 
 /* callback function when DOSBox-X exits */
 void LOG::Exit() {
+	std::lock_guard<std::mutex> lock(logMutex);
 	if (debuglog != NULL) {
 		if (log_dev_con != 2) fprintf(debuglog,"--END OF LOG--\n");
 		fclose(debuglog);
@@ -929,7 +969,8 @@ void LOG::operator() (char const* format, ...){
 
 	if (d_type>=LOG_MAX) return;
 	if (d_severity < loggrp[d_type].min_severity) return;
-	DEBUG_ShowMsg("%10u%s %s:%s\n",static_cast<uint32_t>(cycle_count),s_severity,loggrp[d_type].front,buf);
+	// cycle_count belongs to the emulation thread
+	DEBUG_ShowMsg("%10u%s %s:%s\n",static_cast<uint32_t>(IsEmulationThread() ? cycle_count : 0),s_severity,loggrp[d_type].front,buf);
 }
 
 void LOG::ParseEnableSetting(_LogGroup &group,const char *setting) {
@@ -1025,6 +1066,8 @@ void LOG::Init() {
 
 void LOG::EarlyInit(void) {
 	assert(control != NULL);
+
+	logEmulationThread = std::this_thread::get_id();
 
 	/* do not init twice */
 	if (has_LOG_EarlyInit) return;
