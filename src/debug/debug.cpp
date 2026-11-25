@@ -20,6 +20,8 @@
 #include "dosbox.h"
 #if C_DEBUG
 #include <algorithm>
+#include <chrono>
+#include <thread>
 #include <cctype>
 #include <cstring>
 #include <list>
@@ -193,6 +195,9 @@ static GDBServer* gdbServer = nullptr;
 static bool gdb_break_on_exec = false;  // Flag for GDB-aware program execution
 static bool gdb_cpu_paused = false;     // CPU paused waiting for GDB command
 static void DEBUG_GDBSendHitReply(void);
+// A GDB step handed a callback or loop exit to the main loop; report the
+// stop at the next GDB check, once the main loop has handled it.
+static bool gdb_step_reply_pending = false;
 #endif
 
 extern int debuggerrun;
@@ -5321,6 +5326,7 @@ void DEBUG_Enable_Handler(bool pressed) {
         LOG(LOG_REMOTE, LOG_DEBUG)("DEBUG: Breakpoint hit - signaling to GDB client");
         DEBUG_GDBSendHitReply();
         gdb_cpu_paused = true;  // Pause CPU until GDB sends continue/step
+        gdb_step_reply_pending = false;  // this stop answers a pending step
         return;
     }
 #endif
@@ -6930,11 +6936,49 @@ static void DEBUG_GDBSendHitReply(void) {
     }
 }
 
+// Executes the instruction at CS:EIP with breakpoints there suppressed, as the
+// interactive debugger does, and returns the decoder's result.
+static Bits DEBUG_GDBRunOneInstruction(void) {
+    skipFirstInstruction = true;
+    mustCompleteInstruction = true;
+    CPU_CycleLeft += CPU_Cycles - 1;
+    CPU_Cycles = 1;
+    const bool saved_allow = dosbox_allow_nonrecursive_page_fault;
+    dosbox_allow_nonrecursive_page_fault = true;
+    Bits ret;
+    try {
+        ret = (*cpudecoder)();
+    } catch (...) {
+        dosbox_allow_nonrecursive_page_fault = saved_allow;
+        mustCompleteInstruction = false;
+        throw;
+    }
+    dosbox_allow_nonrecursive_page_fault = saved_allow;
+    mustCompleteInstruction = false;
+    return ret;
+}
+
+static void DEBUG_GDBSendStepReply(void) {
+    uint32_t watch_address;
+    if (DEBUG_GDBResyncWatchpoints(&watch_address))
+        gdbServer->send_watch_reply(watch_address);
+    else
+        gdbServer->send_stop_reply();
+    gdb_cpu_paused = true;
+}
+
+// Avoids spinning the host CPU while GDB holds the emulator stopped.
+static void DEBUG_GDBServiceStopped(void) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+}
+
 // Shuts the GDB server down before leaving the emulation loop: shutdown runs
 // further emulation, which a GDB stop would otherwise hold indefinitely.
 [[noreturn]] static void DEBUG_GDBKill(void) {
     gdb_cpu_paused = false;
+    gdb_step_reply_pending = false;
     // Stop without deleting: the QMP thread may be reading the server state
+    DEBUG_GDBRemoveAllBreakpoints();
     gdbServer->stop();
     throw 0;
 }
@@ -6943,14 +6987,23 @@ static void DEBUG_GDBHandleDisconnect(void) {
     LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: GDB client disconnected");
     DEBUG_GDBRemoveAllBreakpoints();
     gdb_cpu_paused = false;
+    gdb_step_reply_pending = false;
 }
 
- // Called by the main loop to check and handle GDB commands.
- // Polls the GDB server (non-blocking) and processes any received commands.
- // Returns true if CPU should be paused (caller should return from loop iteration).
- bool DEBUG_CheckGDBStep() {
+ // Called by the main loop to handle GDB commands. Returns true while GDB holds
+ // the CPU stopped. When a step or continue executed an instruction whose
+ // decoder result needs the main loop (a callback, or leaving a nested loop),
+ // that result is stored in *decoder_ret for the main loop to handle as usual.
+ bool DEBUG_CheckGDBStep(Bits* decoder_ret) {
+    *decoder_ret = 0;
     if (gdbServer == nullptr || !gdbServer->is_running()) {
         return false;
+    }
+
+    if (gdb_step_reply_pending) {
+        gdb_step_reply_pending = false;
+        DEBUG_GDBSendStepReply();
+        return true;
     }
 
     // Poll for incoming GDB commands (non-blocking)
@@ -6959,38 +7012,47 @@ static void DEBUG_GDBHandleDisconnect(void) {
     switch (action) {
         case GDBAction::STEP: {
             LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: GDB step request");
-            uint32_t eip_before = DEBUG_GetRegister(8);
-
-            // If CPU is in HLT state, force exit from it
-            if (CPU_IsHLTed()) {
-                CPU_ExitHLT();
-            }
-
-            // Execute exactly one instruction
-            skipFirstInstruction = true;
-            mustCompleteInstruction = true;
-            DEBUG_Run(1, true);
-            mustCompleteInstruction = false;
-
-            uint32_t eip_after = DEBUG_GetRegister(8);
-            LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: Step completed, EIP=0x%X->0x%X", eip_before, eip_after);
-
-            // Send stop reply to GDB. A step that writes a watched byte reports the
-            // watchpoint now, so the next continue does not stop without executing.
-            uint32_t watch_address;
-            if (DEBUG_GDBResyncWatchpoints(&watch_address))
-                gdbServer->send_watch_reply(watch_address);
-            else
-                gdbServer->send_stop_reply();
-            gdb_cpu_paused = true;
-            return true;  // CPU should pause
+            gdb_cpu_paused = false;
+            if (CPU_IsHLTed()) CPU_ExitHLT();
+            // The reply is sent only by the pending check, at the next GDB check:
+            // after the main loop handled a callback (nested guest code it runs,
+            // such as INT 10h from a DOS service, is stepped into) or a fault
+            gdb_step_reply_pending = true;
+            *decoder_ret = DEBUG_GDBRunOneInstruction();
+            return *decoder_ret == 0;  // nothing for the main loop: yield
         }
 
-        case GDBAction::CONTINUE:
+        case GDBAction::CONTINUE: {
             LOG(LOG_REMOTE, LOG_DEBUG)("DEBUG: GDB continue request");
-            CBreakpoint::ActivateBreakpoints();
             gdb_cpu_paused = false;
+            // A watchpoint still pending from the last stop is reported first
+            uint32_t pending_watch;
+            if (DEBUG_GDBResyncWatchpoints(&pending_watch)) {
+                gdbServer->send_watch_reply(pending_watch);
+                gdb_cpu_paused = true;
+                return true;
+            }
+            // Arm breakpoints (nested emulation started by the next instruction
+            // must see them), then execute the stopped instruction, whose own
+            // breakpoint is skipped. A halted CPU stays halted.
+            CBreakpoint::ActivateBreakpoints();
+            if (!CPU_IsHLTed()) {
+                const Bits ret = DEBUG_GDBRunOneInstruction();
+                if (ret != 0) {
+                    *decoder_ret = ret;
+                    return false;
+                }
+                // Nested emulation may have stopped for GDB meanwhile
+                if (gdb_step_reply_pending || gdb_cpu_paused) return true;
+                uint32_t watch_address;
+                if (DEBUG_GDBResyncWatchpoints(&watch_address)) {
+                    gdbServer->send_watch_reply(watch_address);
+                    gdb_cpu_paused = true;
+                    return true;
+                }
+            }
             return false;  // Continue normal execution
+        }
 
         case GDBAction::STOP:
             LOG(LOG_REMOTE, LOG_NORMAL)("DEBUG: GDB stop request");
@@ -7009,6 +7071,7 @@ static void DEBUG_GDBHandleDisconnect(void) {
         default:
             // If paused waiting for GDB command, keep paused
             if (gdb_cpu_paused && gdbServer->has_client()) {
+                DEBUG_GDBServiceStopped();
                 return true;
             }
             return false;

@@ -472,30 +472,36 @@ static Bitu Normal_Loop(void) {
 
     try {
         while (1) {
+            Bits gdb_ret = 0;
 #if defined(C_DEBUG) && defined(C_DOSBOX_AGENT)
             dosbox_agent::AGENT_BridgePump();
 #endif
 #if C_REMOTEDEBUG
-            // Check for GDB step/continue requests from the GDB server thread
-            if (DEBUG_CheckGDBStep()) {
-                // Step was executed, return to allow loop to be called again
-                return 0;
-            }
+            // QMP requests are served even while GDB holds the CPU stopped.
             // Check for save/load state requests from QMP
             SAVESTATE_CheckPendingRequest();
             // Check for emulator control requests from QMP (pause/reset)
             EMULATOR_CheckPendingControl();
             // Process pending QMP input events (keyboard, mouse) - thread-safe queue
             QMP_ProcessPendingInputEvents();
+            // Handle GDB requests; while GDB holds the CPU stopped, return to
+            // let the loop be called again
+            if (DEBUG_CheckGDBStep(&gdb_ret))
+                return 0;
 #endif
-            if (PIC_RunQueue()) {
-                /* now is the time to check for the NMI (Non-maskable interrupt) */
-                CPU_Check_NMI();
-
+            if (gdb_ret != 0 || PIC_RunQueue()) {
                 saved_allow = dosbox_allow_nonrecursive_page_fault;
-                dosbox_allow_nonrecursive_page_fault = true;
-                ret = (*cpudecoder)();
-                dosbox_allow_nonrecursive_page_fault = saved_allow;
+                if (gdb_ret != 0) {
+                    // An instruction GDB executed: handle its result as usual
+                    ret = gdb_ret;
+                } else {
+                    /* now is the time to check for the NMI (Non-maskable interrupt) */
+                    CPU_Check_NMI();
+
+                    dosbox_allow_nonrecursive_page_fault = true;
+                    ret = (*cpudecoder)();
+                    dosbox_allow_nonrecursive_page_fault = saved_allow;
+                }
 
                 if (GCC_UNLIKELY(ret<0))
                     return 1;

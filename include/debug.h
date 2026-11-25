@@ -82,9 +82,9 @@ void DEBUG_StartGDBServer(int port);
 void DEBUG_StopGDBServer();
 void DEBUG_StartQMPServer(int port);
 void DEBUG_StopQMPServer();
-// Called by main loop to check and handle GDB step/continue requests
-// Returns true if a step was executed (caller should return from loop)
-bool DEBUG_CheckGDBStep();
+// Called by the main loop to handle GDB requests; true while GDB holds the CPU
+// stopped. *decoder_ret is a decoder result for the main loop to handle.
+bool DEBUG_CheckGDBStep(Bits* decoder_ret);
 
 // GDB breakpoints and watchpoints by Z packet type, at linear addresses:
 // 1 = done, 0 = unsupported in this build, -1 = error
