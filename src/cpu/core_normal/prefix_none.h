@@ -1325,9 +1325,10 @@
         opcode_f0:
 #endif
 		REMEMBER_PREFIX(MP_NONE);
-		if (CPU_CORE >= CPU_ARCHTYPE_80186 &&
-			!CPU_LockPrefixValid(core.cseip, LockPrefixRead))
-			EXCEPTION(EXCEPTION_UD);
+		{
+			const int lock_fault = CPU_LockPrefixFault(core.cseip - (GETIP - reg_eip), LockPrefixRead);
+			if (lock_fault >= 0) EXCEPTION(lock_fault);
+		}
 		goto restart_opcode;
 #if CPU_CORE >= CPU_ARCHTYPE_80186
 	CASE_B(0xf1)												/* ICEBP */

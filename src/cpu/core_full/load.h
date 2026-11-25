@@ -485,9 +485,10 @@ l_M_Ed:
 	case D_NOP:
 		goto nextopcode;
 	case D_LOCK:
-		if (CPU_ArchitectureType >= CPU_ARCHTYPE_80186 &&
-			!CPU_LockPrefixValid(inst.cseip, LockPrefixRead))
-			EXCEPTION(EXCEPTION_UD);
+		{
+			const int lock_fault = CPU_LockPrefixFault(inst.cseip - (GetIP() - reg_eip), LockPrefixRead);
+			if (lock_fault >= 0) EXCEPTION(lock_fault);
+		}
 		goto restartopcode;
 	case D_ENTERw:
 		{

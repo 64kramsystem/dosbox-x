@@ -25,11 +25,6 @@
 #include "dyn_fpu.h"
 #include <stddef.h>
 
-#include "lock.h"
-static INLINE uint8_t LockPrefixRead(PhysPt address) {
-	return mem_readb(address);
-}
-
 /*
 	The function CreateCacheBlock translates the instruction stream
 	until either an unhandled instruction is found, the maximum
@@ -292,9 +287,8 @@ restart_prefix:
 		case 0x66:decode.big_op=!cpu.code.big;goto restart_prefix;
 		case 0x67:decode.big_addr=!cpu.code.big;goto restart_prefix;
 		case 0xf0:	// lock
-			if (CPU_ArchitectureType >= CPU_ARCHTYPE_80186 &&
-				!CPU_LockPrefixValid(decode.code, LockPrefixRead))
-				goto illegalopcode;
+			// The interpreter validates LOCK through its own instruction fetch.
+			if (CPU_ArchitectureType >= CPU_ARCHTYPE_80186) goto illegalopcode;
 			goto restart_prefix;
 
 		// 'push imm8/16/32'

@@ -54,10 +54,6 @@ extern bool ignore_opcode_63;
 #define SaveMd(off,val)	mem_writed_inline(off,val)
 #define SaveMq(off,val) {mem_writed_inline(off,val&0xffffffff);mem_writed_inline(off+4,(val>>32)&0xffffffff);}
 
-static INLINE uint8_t LockPrefixRead(PhysPt address) {
-	return mem_readb_inline(address);
-}
-
 extern Bitu cycle_count;
 
 #if C_FPU
@@ -140,6 +136,13 @@ static unsigned int pq_hit=0,pq_miss=0;
 #define prefetch_unit       (4ul)
 
 #include "core_prefetch_buf.h"
+
+// LOCK validation must see the bytes the decoder executes, including stale
+// prefetched bytes of self-modified code.
+static INLINE uint8_t LockPrefixRead(PhysPt address) {
+	if (prefetch_hit<uint8_t>(address)) return prefetch_read<uint8_t>(address);
+	return LoadMb(address);
+}
 
 static INLINE void FetchDiscardb() {
 	FetchDiscard<uint8_t>();

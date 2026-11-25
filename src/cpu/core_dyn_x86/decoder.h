@@ -2484,11 +2484,6 @@ static void dyn_larlsl(bool islar) {
 #define dyn_mmx_check() if ((dyn_dh_fpu.dh_fpu_enabled) && (!fpu_used)) {dh_fpu_startup();}
 #endif
 
-#include "lock.h"
-static INLINE uint8_t LockPrefixRead(PhysPt address) {
-	return mem_readb(address);
-}
-
 static CacheBlock * CreateCacheBlock(CodePageHandler * codepage,PhysPt start,Bitu max_opcodes) {
 	Bits i;
 
@@ -3155,9 +3150,8 @@ restart_prefix:
 			dyn_check_bool_exception_al();
 			break;
 		case 0xf0:		//LOCK
-			if (CPU_ArchitectureType >= CPU_ARCHTYPE_80186 &&
-				!CPU_LockPrefixValid(decode.code, LockPrefixRead))
-				goto illegalopcode;
+			// The interpreter validates LOCK through its own instruction fetch.
+			if (CPU_ArchitectureType >= CPU_ARCHTYPE_80186) goto illegalopcode;
 			goto restart_prefix;
 		case 0xf2:		//REPNE/NZ
 			decode.rep=REP_NZ;
